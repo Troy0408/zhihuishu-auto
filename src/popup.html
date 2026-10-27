@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>智慧树自动刷课</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        智慧树自动刷课
+        <span class="ver">v0.4.1</span>
+      </div>
+      <label class="switch" title="总开关">
+        <input type="checkbox" id="enabled" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="status" id="status">
+      <div class="dot" id="dot"></div>
+      <div class="status-text" id="statusText">正在读取当前页面…</div>
+    </section>
+
+    <section class="rows">
+      <label class="row">
+        <span>自动静音</span>
+        <input type="checkbox" id="mute" />
+      </label>
+      <label class="row">
+        <span>播完自动下一节</span>
+        <input type="checkbox" id="autoNext" />
+      </label>
+      <label class="row">
+        <span>跳过已完成章节</span>
+        <input type="checkbox" id="skipCompleted" />
+      </label>
+      <label class="row">
+        <span>切后台/最小化继续播</span>
+        <input type="checkbox" id="keepPlaying" />
+      </label>
+      <label class="row">
+        <span>自动答弹题</span>
+        <input type="checkbox" id="quiz" />
+      </label>
+      <label class="row">
+        <span>答题策略</span>
+        <select id="answerStrategy">
+          <option value="first">自动选正解（推荐）</option>
+          <option value="random">随机选</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>页面右下角状态角标</span>
+        <input type="checkbox" id="showBadge" />
+      </label>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><b id="quizAnswered">0</b><span>已答弹题</span></div>
+      <div class="stat"><b id="nextClicked">0</b><span>切换章节</span></div>
+      <div class="stat"><b id="resumeClicked">0</b><span>恢复播放</span></div>
+    </section>
+
+    <section class="actions">
+      <button id="scan">立即扫描</button>
+      <button id="reset" class="ghost">重置统计</button>
+    </section>
+
+    <footer>
+      仅供个人学习效率辅助，请遵守平台与学校规则。
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

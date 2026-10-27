@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "智慧树自动刷课（自用）",
+  "version": "0.4.1",
+  "description": "自动播放智慧树共享课视频、自动作答弹题、自动切换下一节。仅用于个人学习辅助。",
+  "permissions": ["storage"],
+  "host_permissions": ["*://studyvideoh5.zhihuishu.com/*"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "智慧树自动刷课",
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://studyvideoh5.zhihuishu.com/*"],
+      "js": ["src/main-world.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://studyvideoh5.zhihuishu.com/*"],
+      "js": ["src/config.js", "src/app.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
