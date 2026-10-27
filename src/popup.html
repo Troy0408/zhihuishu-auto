@@ -10,7 +10,7 @@
     <header>
       <div class="title">
         智慧树自动刷课
-        <span class="ver">v0.4.1</span>
+        <span class="ver">v0.5.0</span>
       </div>
       <label class="switch" title="总开关">
         <input type="checkbox" id="enabled" />
@@ -57,8 +57,46 @@
       </label>
     </section>
 
-    <section class="stats">
+    <section class="rows ai-box">
+      <label class="row">
+        <span>自动过安全验证（AI 视觉）</span>
+        <input type="checkbox" id="autoCaptcha" />
+      </label>
+      <div id="aiConfigWrap" class="ai-fields">
+        <label class="field">
+          <span>AI 服务商</span>
+          <select id="aiProvider">
+            <option value="siliconflow">硅基流动 SiliconFlow（推荐 Qwen-VL）</option>
+            <option value="deepseek">DeepSeek 官方</option>
+            <option value="dashscope">阿里云百炼 DashScope</option>
+            <option value="zhipu">智谱清言 GLM-4V</option>
+            <option value="openai_custom">自定义 OpenAI 兼容接口</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>API 地址 (Base URL)</span>
+          <input type="text" id="aiBaseUrl" placeholder="https://api.siliconflow.cn/v1" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>模型名称 (需支持视觉识图)</span>
+          <input type="text" id="aiModel" placeholder="Qwen/Qwen2.5-VL-72B-Instruct" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <div class="key-row">
+            <input type="password" id="aiApiKey" placeholder="sk-..." spellcheck="false" autocomplete="off" />
+            <button type="button" id="testAi" class="mini-btn">测试</button>
+          </div>
+        </label>
+        <div class="ai-hint" id="aiHint">
+          用于自动识别「请点击灰色大写U」等 3D 立体字安全验证。
+        </div>
+      </div>
+    </section>
+
+    <section class="stats stats-4">
       <div class="stat"><b id="quizAnswered">0</b><span>已答弹题</span></div>
+      <div class="stat"><b id="captchaSolved">0</b><span>已过验证</span></div>
       <div class="stat"><b id="nextClicked">0</b><span>切换章节</span></div>
       <div class="stat"><b id="resumeClicked">0</b><span>恢复播放</span></div>
     </section>

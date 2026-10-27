@@ -14,7 +14,7 @@
 }
 
 body {
-  width: 320px;
+  width: 340px;
   margin: 0;
   padding: 14px;
   background: var(--bg);
@@ -162,6 +162,71 @@ header {
   font-size: 12px;
 }
 
+/* AI 视觉验证配置区 */
+.ai-fields {
+  padding: 6px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.field select,
+.field input[type="text"],
+.field input[type="password"] {
+  width: 100%;
+  background: #0d1117;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 7px;
+  font-size: 12px;
+  outline: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: #388bfd;
+}
+
+.key-row {
+  display: flex;
+  gap: 6px;
+}
+
+.key-row input {
+  flex: 1;
+}
+
+.mini-btn {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+.ai-hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+  margin-top: 2px;
+}
+
+.ai-hint.ok {
+  color: var(--green);
+}
+
+.ai-hint.err {
+  color: var(--red);
+}
+
 /* 统计 */
 .stats {
   display: grid;
@@ -170,11 +235,16 @@ header {
   margin-bottom: 10px;
 }
 
+.stats.stats-4 {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
 .stat {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 8px 6px;
+  padding: 8px 4px;
   text-align: center;
   display: flex;
   flex-direction: column;
@@ -182,7 +252,7 @@ header {
 }
 
 .stat b {
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
 }
 

@@ -1,5 +1,5 @@
 /**
- * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.4.3）。
+ * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.5.0）。
  *
  * 核心职责：
  *  1. 伪装页面可见性（hidden / visibilityState / hasFocus），切后台不暂停。
@@ -14,6 +14,9 @@
  *       配合后台 Service Worker 1.5s 心跳，保证前后台均严格按 1x 真实时间单步触发，
  *       绝不与页面原生 setInterval 重复叠加，避免触发服务端进度校验失败（backDialog）
  *     - 若偶发网络波动弹出 backDialog（“因网络连接问题，导致学习进度提交失败”），自动关闭并重新同步当前小节状态继续播放
+ *     - 深度接管网易易盾（yidunInstance）安全验证组件（3D 空间文字/数字点选验证码）：
+ *       读取内部组件状态（token / load / bg / front / verifyStatus），并在获取 AI 识别坐标后模拟人类轨迹直接调用内部 trackMoving + addPoint 触发验证，
+ *       如遇连续 5 次错误弹出 showToastDialog，自动调用 toastDialogClick(1) 重新拉起图像验证码而非进入短信验证
  *  4. 在 window 捕获阶段拦截落入 #container 的非可信点击，避免触发播放器容器的捕获监听。
  */
 (() => {
@@ -452,6 +455,7 @@
 
     // 只有 Vue 状态为 isStudiedLesson === 1（或 DOM 中明确出现对勾图标 .time_icofinish）才算真正完成
     const curDone = Boolean((curLesson && curLesson.done) || domDone);
+    const capState = getCaptchaState(vm);
 
     return {
       hasVm: true,
@@ -466,6 +470,10 @@
       tipsDialog: Boolean(vm.tipsDialog),
       tipsMsg: vm.tipsMsg || '',
       faceVisible: Boolean(vm.FaceVisible || vm.FaceIdentityVisible),
+      showToastDialog: Boolean(vm.showToastDialog),
+      showMessageDialog: Boolean(vm.showMessageDialog),
+      captchaOpen: Boolean(capState && capState.open),
+      captchaState: capState,
       isSaving: Boolean(vm.isSaving),
       totalStudyTime: Number(vm.totalStudyTime) || 0,
       playTimes: Number(vm.playTimes) || 0,
@@ -777,7 +785,8 @@
 
     try {
       const v = document.querySelector('#container video, video.vjs-tech, video');
-      if (v && v.paused && !v.ended && (!vm || !vm.testDialog)) {
+      const capOpen = isCaptchaPopupVisible();
+      if (v && v.paused && !v.ended && (!vm || !vm.testDialog) && !capOpen) {
         const p = v.play();
         if (p && typeof p.catch === 'function') p.catch(() => {});
         played = true;
@@ -788,6 +797,7 @@
         !v.ended &&
         vm &&
         !vm.testDialog &&
+        !capOpen &&
         (!vm.data || vm.data.studyStatus != 1)
       ) {
         if (vm.lastViewVideoId && vm.lastViewVideoId !== lastTrackedVideoId) {
@@ -825,11 +835,267 @@
     return { ok: played };
   }
 
+  // ==================== 5.5 网易易盾（Yidun）安全验证接管与自动化点击 ====================
+
+  function isCaptchaPopupVisible() {
+    try {
+      const pop = document.querySelector('.yidun_popup');
+      if (!pop) return false;
+      const cs = getComputedStyle(pop);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) {
+        return false;
+      }
+      const modal = pop.querySelector('.yidun_modal');
+      if (modal) {
+        const r = modal.getBoundingClientRect();
+        if (r.width < 10 || r.height < 10) return false;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 递归在易盾实例树中查找带有 addPoint / onClick 的空间点选子组件及顶层 store
+   */
+  function findYidunInternalComponents(vm) {
+    const ins = vm && vm.yidunInstance;
+    if (!ins) return { ins: null, modalVm: null, coreVm: null, spaceVm: null, store: null };
+
+    const modalVm = ins._captchaIns || null;
+    let store = (modalVm && modalVm.$store) || ins.$store || null;
+    let coreVm = null;
+    let spaceVm = null;
+
+    const queue = [modalVm, ins].filter(Boolean);
+    const visited = new Set();
+    while (queue.length) {
+      const cur = queue.shift();
+      if (!cur || typeof cur !== 'object' || visited.has(cur)) continue;
+      visited.add(cur);
+      if (!store && cur.$store) store = cur.$store;
+      if (typeof cur.verifyCaptcha === 'function' && typeof cur.fetchCaptcha === 'function') {
+        coreVm = cur;
+      }
+      if (typeof cur.addPoint === 'function' && typeof cur.onClick === 'function') {
+        spaceVm = cur;
+      }
+      if (Array.isArray(cur.$children)) {
+        for (const c of cur.$children) queue.push(c);
+      }
+      if (cur._captchaIns && !visited.has(cur._captchaIns)) {
+        queue.push(cur._captchaIns);
+      }
+    }
+
+    return { ins, modalVm, coreVm, spaceVm, store };
+  }
+
+  function getCaptchaState(vmArg) {
+    const vm = vmArg || findVmFromRoot();
+    // 若连续失败 5 次触发了智慧树的验证方式选择弹窗（showToastDialog），自动选择 1（重新拉起图像验证，避开短信验证）
+    if (vm && vm.showToastDialog && typeof vm.toastDialogClick === 'function') {
+      try {
+        console.log(TAG, '检测到验证失败切换弹窗 (showToastDialog)，自动选 1 重新拉起图像验证码');
+        vm.toastDialogClick(1);
+      } catch (e) {}
+    }
+
+    const open = isCaptchaPopupVisible();
+    if (!open) {
+      return { open: false };
+    }
+
+    const { ins, coreVm, spaceVm, store } = findYidunInternalComponents(vm);
+    const st = (store && store.state) || {};
+    const load = st.load || (spaceVm && spaceVm.loadInfo) || null;
+    const loadStatus = (load && load.status) || '';
+    const loadData = (load && load.data) || {};
+
+    const bgImgEl = document.querySelector('.yidun_popup .yidun_bg-img, .yidun_bg-img');
+    const tipEl = document.querySelector('.yidun_popup .yidun_tips__text, .yidun_tips__text');
+    const domBgSrc = (bgImgEl && bgImgEl.getAttribute('src')) || '';
+    const domTipText = (tipEl && (tipEl.innerText || tipEl.textContent || '').trim()) || '';
+
+    const rect = bgImgEl ? bgImgEl.getBoundingClientRect() : null;
+    const width = (rect && Math.round(rect.width)) || 320;
+    const height = (rect && Math.round(rect.height)) || 160;
+
+    return {
+      open: true,
+      hasYidunIns: Boolean(ins),
+      hasSpaceVm: Boolean(spaceVm),
+      hasCoreVm: Boolean(coreVm),
+      token: st.token || loadData.token || '',
+      verifyStatus: st.verifyStatus || '',
+      countsOfVerifyError: Number(st.countsOfVerifyError) || 0,
+      loadStatus,
+      bgUrl: domBgSrc || (Array.isArray(loadData.bg) ? loadData.bg[0] : loadData.bg) || '',
+      promptText: domTipText || loadData.front || '',
+      width,
+      height,
+    };
+  }
+
+  /**
+   * 刷新易盾验证码题目
+   */
+  function refreshYidunCaptcha() {
+    const vm = findVmFromRoot();
+    const { ins, coreVm } = findYidunInternalComponents(vm);
+    try {
+      if (coreVm && typeof coreVm.refresh === 'function') {
+        coreVm.refresh();
+        return { ok: true, via: 'coreVm' };
+      }
+      if (ins && typeof ins.refresh === 'function') {
+        ins.refresh();
+        return { ok: true, via: 'ins' };
+      }
+      const btn = document.querySelector('.yidun_popup .yidun_refresh, .yidun_refresh');
+      if (btn) {
+        btn.click();
+        return { ok: true, via: 'dom' };
+      }
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+    return { ok: false };
+  }
+
+  /**
+   * 在易盾 3D 空间验证码上模拟拟人化鼠标轨迹并在目标坐标 (x, y) 处完成点击验证。
+   * 优先通过易盾内部 spaceVm 组件方法（trackMoving + addPoint）提交，兼具真实轨迹采样与 isTrusted=1 标记；
+   * 若内部组件未取到，则退化为在 .yidun_bg-img 上派发带完整轨迹的鼠标事件。
+   */
+  function submitYidunSpaceClick(payload = {}) {
+    const vm = findVmFromRoot();
+    const { spaceVm } = findYidunInternalComponents(vm);
+    const bgImgEl =
+      (spaceVm && spaceVm.$bgImg) ||
+      document.querySelector('.yidun_popup .yidun_bg-img, .yidun_bg-img');
+
+    if (!bgImgEl) {
+      return { ok: false, reason: 'no_bg_img' };
+    }
+
+    const rect = bgImgEl.getBoundingClientRect();
+    const w = rect.width || 320;
+    const h = rect.height || 160;
+    const targetX = Math.max(6, Math.min(w - 6, Math.round(Number(payload.x) || w / 2)));
+    const targetY = Math.max(6, Math.min(h - 6, Math.round(Number(payload.y) || h / 2)));
+
+    // 1) 若能直接访问易盾内部点选组件 spaceVm，构造逼真的人类思考时长与鼠标移动轨迹并调用 addPoint
+    if (spaceVm && typeof spaceVm.addPoint === 'function') {
+      try {
+        if (typeof spaceVm.cleanPoints === 'function' && Array.isArray(spaceVm.pointsStack) && spaceVm.pointsStack.length) {
+          spaceVm.cleanPoints();
+        }
+        spaceVm.pointsStack = [];
+        spaceVm.traceData = [];
+
+        // 模拟人类看到图片后经过 680~1130ms 移入并点击
+        const totalDuration = 680 + Math.floor(Math.random() * 450);
+        const nowTs = Date.now();
+        spaceVm.beginTime = nowTs - totalDuration;
+        spaceVm.clickCounts = (Number(spaceVm.clickCounts) || 0) + 1;
+
+        // 生成一条从图片边缘平滑移动到目标点 (targetX, targetY) 的贝塞尔微抖动轨迹（18~28 个采样点）
+        const startX = Math.round(25 + Math.random() * (w - 50));
+        const startY = Math.round(h - 10 - Math.random() * 25);
+        const ctrlX = Math.round((startX + targetX) / 2 + (Math.random() - 0.5) * 40);
+        const ctrlY = Math.round((startY + targetY) / 2 + (Math.random() - 0.5) * 30);
+        const steps = 18 + Math.floor(Math.random() * 10);
+
+        if (typeof spaceVm.trackMoving === 'function') {
+          for (let i = 1; i <= steps; i++) {
+            const p = i / steps;
+            const bx = (1 - p) * (1 - p) * startX + 2 * (1 - p) * p * ctrlX + p * p * targetX;
+            const by = (1 - p) * (1 - p) * startY + 2 * (1 - p) * p * ctrlY + p * p * targetY;
+            const jitterX = i < steps ? (Math.random() - 0.5) * 2.2 : 0;
+            const jitterY = i < steps ? (Math.random() - 0.5) * 2.2 : 0;
+            const curX = Math.max(2, Math.min(w - 2, Math.round(bx + jitterX)));
+            const curY = Math.max(2, Math.min(h - 2, Math.round(by + jitterY)));
+
+            const pointElapsed = Math.round(totalDuration * (0.15 + 0.82 * Math.pow(p, 0.85)));
+            spaceVm.beginTime = Date.now() - pointElapsed;
+            spaceVm.trackMoving({
+              clientX: rect.left + curX,
+              clientY: rect.top + curY,
+              isTrusted: true,
+            });
+          }
+        }
+
+        spaceVm.beginTime = Date.now() - totalDuration;
+        spaceVm.addPoint({ left: targetX, top: targetY });
+
+        console.log(
+          TAG,
+          `已通过易盾内部组件提交点击坐标 (${targetX}, ${targetY})，轨迹点数=${(spaceVm.traceData && spaceVm.traceData.length) || 0}`
+        );
+        return {
+          ok: true,
+          via: 'spaceVm',
+          x: targetX,
+          y: targetY,
+        };
+      } catch (e) {
+        console.warn(TAG, 'spaceVm.addPoint 调用异常，回退 DOM 事件:', e);
+      }
+    }
+
+    // 2) DOM 事件兜底
+    try {
+      const clientX = Math.round(rect.left + targetX);
+      const clientY = Math.round(rect.top + targetY);
+      const startX = Math.round(rect.left + w / 2 + (Math.random() - 0.5) * 60);
+      const startY = Math.round(rect.top + h - 15);
+      const steps = 12;
+      for (let i = 1; i <= steps; i++) {
+        const p = i / steps;
+        const cx = Math.round(startX + (clientX - startX) * p);
+        const cy = Math.round(startY + (clientY - startY) * p);
+        bgImgEl.dispatchEvent(
+          new MouseEvent('mousemove', {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
+        );
+      }
+      const evInit = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY,
+        button: 0,
+        buttons: 1,
+      };
+      bgImgEl.dispatchEvent(new MouseEvent('mousedown', evInit));
+      bgImgEl.dispatchEvent(new MouseEvent('mouseup', { ...evInit, buttons: 0 }));
+      bgImgEl.dispatchEvent(new MouseEvent('click', { ...evInit, buttons: 0 }));
+      return { ok: true, via: 'dom', x: targetX, y: targetY };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }
+
   // ==================== 6. 与 ISOLATED world (app.js) 同步通信桥 ====================
   function execBridgeCmd(cmd, payload) {
     switch (cmd) {
       case 'getState':
         return getVmState();
+      case 'getCaptchaState':
+        return getCaptchaState();
+      case 'submitCaptchaClick':
+        return submitYidunSpaceClick(payload);
+      case 'refreshCaptcha':
+        return refreshYidunCaptcha();
       case 'answerQuiz':
         return answerNextUncheckedQuestion(payload && payload.strategy);
       case 'closeQuiz':

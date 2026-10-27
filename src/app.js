@@ -36,16 +36,26 @@
     answerStrategy: 'first',
     showBadge: false,
     debug: true,
+    autoCaptcha: true,
+    aiProvider: 'siliconflow',
+    aiBaseUrl: 'https://api.siliconflow.cn/v1',
+    aiApiKey: '',
+    aiModel: 'Qwen/Qwen2.5-VL-72B-Instruct',
   };
 
   const S = {
     settings: { ...DEFAULTS },
-    stats: { quizAnswered: 0, nextClicked: 0, resumeClicked: 0, since: Date.now() },
+    stats: { quizAnswered: 0, nextClicked: 0, resumeClicked: 0, captchaSolved: 0, since: Date.now() },
     video: null,
     boundVideo: null,
     quizOpen: false,
     quizBusy: false,
     quiz: { q: '', clicks: 0 },
+    captchaOpen: false,
+    captchaBusy: false,
+    lastCaptchaToken: '',
+    lastCaptchaAttemptAt: 0,
+    captchaErrorHint: '',
     advancePending: false,
     advanceTimer: 0,
     nextLockUntil: 0,
@@ -257,7 +267,7 @@
           return;
         }
         const st = callMainWorld('getState');
-        if (S.quizOpen || (st && (st.testDialog || st.faceVisible)) || findQuizDialog()) return;
+        if (S.quizOpen || S.captchaOpen || (st && (st.testDialog || st.captchaOpen || st.faceVisible)) || findQuizDialog()) return;
         tryPlay(v);
       }, 1200);
     });
@@ -460,6 +470,138 @@
     } finally {
       S.quizBusy = false;
       S.quizOpen = isQuizActive();
+      renderBadge();
+    }
+  }
+
+  // ---------- 网易易盾安全验证（3D 空间文字/数字点选）处理 ----------
+
+  function isCaptchaActive() {
+    const cap = callMainWorld('getCaptchaState');
+    if (cap && cap.open) return true;
+    try {
+      const pop = document.querySelector('.yidun_popup');
+      if (pop && isVisible(pop)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  /**
+   * 尝试将页面上的 .yidun_bg-img 转为 Base64 DataURL（若跨域污染则交由 background fetch）
+   */
+  function tryCaptureImgDataUrl(imgEl) {
+    if (!imgEl || !imgEl.complete || !imgEl.naturalWidth) return '';
+    try {
+      const c = document.createElement('canvas');
+      c.width = imgEl.naturalWidth || 320;
+      c.height = imgEl.naturalHeight || 160;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(imgEl, 0, 0);
+      return c.toDataURL('image/jpeg', 0.92);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  async function handleCaptcha() {
+    if (!S.settings.enabled || S.settings.autoCaptcha === false) return;
+    if (S.captchaBusy) return;
+
+    const cap = callMainWorld('getCaptchaState');
+    if (!cap || !cap.open) {
+      S.captchaOpen = false;
+      S.captchaErrorHint = '';
+      return;
+    }
+
+    S.captchaOpen = true;
+    if (!String(S.settings.aiApiKey || '').trim()) {
+      S.captchaErrorHint = '未配置 AI API Key';
+      renderBadge();
+      return;
+    }
+
+    // 避免对同一个正在验证中或刚点过的 token 重复并发请求
+    if (cap.verifyStatus === 'verifying' || cap.verifyStatus === 'success') return;
+    if (cap.loadStatus && cap.loadStatus !== 'done') return;
+    if (!cap.bgUrl || !cap.promptText) return;
+
+    const tokenKey = `${cap.token || ''}|${cap.bgUrl}|${cap.promptText}`;
+    if (tokenKey === S.lastCaptchaToken) {
+      const elapsed = now() - S.lastCaptchaAttemptAt;
+      if (elapsed < 4500) return;
+      // 若同一张图 5 秒后仍停留在弹窗中（例如 AI 解析失败或点击未触发刷新），主动刷新换一张新图再试
+      if (elapsed >= 5000 && elapsed < 12000) {
+        log('当前验证码图片停留超时，主动刷新换一张新图重试');
+        callMainWorld('refreshCaptcha');
+        S.lastCaptchaAttemptAt = now();
+        return;
+      }
+    }
+
+    S.captchaBusy = true;
+    S.captchaErrorHint = '';
+    renderBadge();
+
+    try {
+      await sleep(rand(700, 1200));
+
+      const freshCap = callMainWorld('getCaptchaState');
+      if (!freshCap || !freshCap.open) return;
+      if (!freshCap.bgUrl || !freshCap.promptText) return;
+
+      const bgImgEl = document.querySelector('.yidun_popup .yidun_bg-img, .yidun_bg-img');
+      const imageDataUrl = tryCaptureImgDataUrl(bgImgEl);
+
+      log(`检测到安全验证：「${freshCap.promptText}」，正在调用 AI 视觉定位 (${S.settings.aiModel})…`);
+      S.lastCaptchaToken = `${freshCap.token || ''}|${freshCap.bgUrl}|${freshCap.promptText}`;
+      S.lastCaptchaAttemptAt = now();
+
+      const aiRes = await chrome.runtime.sendMessage({
+        type: 'ZHS_SOLVE_CAPTCHA',
+        payload: {
+          imageUrl: freshCap.bgUrl,
+          imageDataUrl: imageDataUrl || undefined,
+          promptText: freshCap.promptText,
+          width: freshCap.width || 320,
+          height: freshCap.height || 160,
+        },
+      });
+
+      if (!aiRes || !aiRes.ok) {
+        const errMsg = (aiRes && aiRes.error) || 'AI 识别失败';
+        S.captchaErrorHint = errMsg;
+        warn('安全验证 AI 识别未成功：', errMsg);
+        renderBadge();
+        return;
+      }
+
+      log(`AI 识别坐标: (${aiRes.x}, ${aiRes.y})，原始回复: ${String(aiRes.raw || '').replace(/\s+/g, ' ')}`);
+      await sleep(rand(250, 550));
+
+      const clickRes = callMainWorld('submitCaptchaClick', { x: aiRes.x, y: aiRes.y });
+      log('已提交安全验证点击:', clickRes);
+
+      // 等待 1.8s 检查验证结果：若通过则自动恢复视频播放；若失败易盾将在 1.2s 后自动刷新下一张图
+      await sleep(1800);
+      const afterCap = callMainWorld('getCaptchaState');
+      if (!afterCap || !afterCap.open || afterCap.verifyStatus === 'success') {
+        S.stats.captchaSolved = (S.stats.captchaSolved || 0) + 1;
+        saveStats();
+        S.captchaOpen = false;
+        S.captchaErrorHint = '';
+        log('安全验证已通过！恢复视频播放与进度记录');
+        await sleep(rand(600, 1000));
+        const v = ensureVideo();
+        if (v && S.settings.keepPlaying) tryPlay(v);
+      } else {
+        log('本次点击未通过验证，等待自动刷新后重试…');
+      }
+    } catch (e) {
+      warn('安全验证处理异常:', e);
+    } finally {
+      S.captchaBusy = false;
+      S.captchaOpen = isCaptchaActive();
       renderBadge();
     }
   }
@@ -735,6 +877,12 @@
     if (!S.settings.enabled) return;
     if (checkBlocked()) return;
 
+    if (isCaptchaActive()) {
+      S.captchaOpen = true;
+      void handleCaptcha();
+      return;
+    }
+
     if (isQuizActive()) {
       S.quizOpen = true;
       void handleQuiz();
@@ -774,7 +922,9 @@
       document.documentElement.appendChild(S.badge);
     }
     let extra = '';
-    if (S.quizOpen) extra = ' · 答题中';
+    if (S.captchaOpen) {
+      extra = S.captchaErrorHint ? ` · 安全验证(${S.captchaErrorHint.slice(0, 14)})` : ' · 安全验证识别中';
+    } else if (S.quizOpen) extra = ' · 答题中';
     else if (S.replayingVideoId) extra = ` · 补播重刷中(第${S.replayCount}次)`;
     S.badge.textContent = S.blocked
       ? '智慧树助手 已暂停'
@@ -800,6 +950,8 @@
       S.boundVideo = null;
       S.quizOpen = false;
       S.quiz = { q: '', clicks: 0 };
+      S.captchaOpen = false;
+      S.captchaErrorHint = '';
       S.replayingVideoId = '';
       S.replayCount = 0;
       S.replayDoneAdvancePending = false;
@@ -810,6 +962,14 @@
     const st = callMainWorld('getState');
     if (st && (st.imgDialog || st.lookHabitDialog || st.readDialog || st.backDialog)) {
       clickResumePrompt();
+    }
+
+    const captchaActive = Boolean((st && st.captchaOpen) || isCaptchaActive());
+    S.captchaOpen = captchaActive;
+    if (captchaActive) {
+      renderBadge();
+      void handleCaptcha();
+      return;
     }
 
     maybeJumpToUnfinished();
@@ -877,6 +1037,9 @@
       replaying: Boolean(S.replayingVideoId),
       replayCount: S.replayCount || 0,
       quizOpen: S.quizOpen,
+      captchaOpen: S.captchaOpen,
+      captchaPrompt: st && st.captchaState ? st.captchaState.promptText : '',
+      captchaErrorHint: S.captchaErrorHint || '',
       blocked: S.blocked,
       stats: { ...S.stats },
     };

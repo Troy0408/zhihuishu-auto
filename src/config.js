@@ -13,7 +13,7 @@
  * 平台改版时优先改这里。
  */
 window.ZHS_CONFIG = {
-  version: '0.4.3',
+  version: '0.5.0',
 
   selectors: {
     video: ['#container video', 'video.vjs-tech', 'video'],
@@ -29,6 +29,12 @@ window.ZHS_CONFIG = {
     quizPager: ['.el-pager li.number'],
     quizFooter: ['.dialog-footer .btn', '.el-dialog__footer .btn', '.el-dialog__footer button'],
     quizCloseBtn: ['.el-dialog__headerbtn', '.el-dialog__close'],
+
+    // 网易易盾安全验证弹窗（3D 空间文字/数字点选）
+    captchaPopup: ['.yidun_popup', '.yidun_modal__wrap'],
+    captchaBgImg: ['.yidun_bg-img'],
+    captchaTip: ['.yidun_tips__text', '.yidun-fallback__tip'],
+    captchaRefresh: ['.yidun_refresh'],
 
     // 章节列表
     chapterList: [
