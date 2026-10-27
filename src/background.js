@@ -1,9 +1,10 @@
 /**
- * 后台 Service Worker（MV3）
- * 只做三件事：
+ * 后台 Service Worker（MV3，v0.4.2）
+ * 职责：
  *  1. 首次安装时写入默认配置
  *  2. 给工具栏图标显示开关状态
- *  3. 转发“设置已变更”的消息（内容脚本自己也会监听 storage 变化）
+ *  3. 维护与内容脚本的长连接（zhs-keepalive），每 2s 发送一次不受后台标签页节流影响的心跳，
+ *     驱动后台标签页持续补偿学习时长计时器与完课状态检测
  */
 
 const DEFAULTS = {
@@ -18,6 +19,50 @@ const DEFAULTS = {
   showBadge: false,
   debug: true,
 };
+
+const activePorts = new Set();
+let heartbeatTimer = null;
+
+function ensureHeartbeat() {
+  if (activePorts.size > 0 && !heartbeatTimer) {
+    heartbeatTimer = setInterval(() => {
+      const ts = Date.now();
+      for (const port of [...activePorts]) {
+        try {
+          port.postMessage({ type: 'heartbeat', ts });
+        } catch (e) {
+          activePorts.delete(port);
+        }
+      }
+      if (activePorts.size === 0 && heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }, 2000);
+  } else if (activePorts.size === 0 && heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== 'zhs-keepalive') return;
+  activePorts.add(port);
+  ensureHeartbeat();
+
+  port.onMessage.addListener((msg) => {
+    if (msg && msg.type === 'ping') {
+      try {
+        port.postMessage({ type: 'heartbeat', ts: Date.now() });
+      } catch (e) {}
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    activePorts.delete(port);
+    ensureHeartbeat();
+  });
+});
 
 chrome.runtime.onInstalled.addListener(async () => {
   const { settings } = await chrome.storage.local.get('settings');

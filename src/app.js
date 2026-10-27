@@ -1,14 +1,16 @@
 /**
- * 智慧树共享课自动刷课 —— 内容脚本主体（v0.4.1）。
+ * 智慧树共享课自动刷课 —— 内容脚本主体（v0.4.2）。
  *
  * 核心机制：
  *   - 通过同步桥接调用 src/main-world.js 中已接管的 stuStudy Vue 实例（vm）：
  *     1) 弹题作答：直接调用 vm.topicClickQot(opt, 1) 并选取 result===1 的正确项（兼容单选/多选/判断/多题连弹）
  *     2) 关闭弹题：直接调用 vm.closeTest({ isTrusted: true })，彻底避开合成 DOM 点击导致的 notTrustScript() 拦截
  *     3) 未完成检测与重播：视频播到底时检查当前小节是否真正出现完成对勾（isStudiedLesson===1 / .time_icofinish）；
- *        若未完成（如卡在 74%），自动从 00:00 重新播放当前视频，直到拿到完成对勾后再切换到下一集
- *     4) 后台计时补偿：通过 video 的 timeupdate 事件驱动学习时长心跳补偿，防止切后台后 setInterval 被浏览器节流导致进度少算
- *     5) 切换章节：直接调用 vm.videoClick(...)，支持打开页面时自动跳过已完成节、播完自动切下一未完成节
+ *        若未完成（如卡在 48%/61%/74%），自动从 00:00 重新播放当前视频，直到拿到完成对勾后再切换到下一集
+ *     4) 后台防节流双保险：
+ *        - 通过与 MV3 后台 Service Worker 建立长连接（zhs-keepalive）接收每 2s 一次的不受后台节流影响的心跳
+ *        - 结合真实挂钟时间（Wall-Clock）多步补偿 totalStudyTimeFun 与 learningTimeRecord，彻底解决后台刷课进度折半问题
+ *     5) 严格按序补刷：若检测到当前小节之前存在未完成小节（如已跳到 3.3 但 3.1/3.2 仍未出对勾），自动切回最早未完成小节逐个刷满
  */
 (() => {
   'use strict';
@@ -558,10 +560,11 @@
       return;
     }
 
+    callMainWorld('flushProgress');
     S.replayingVideoId = '';
     S.replayCount = 0;
 
-    // 1) 优先通过 Vue 实例切换章节
+    // 1) 优先通过 Vue 实例切换章节（若前面有遗漏未完成的节如 3.1/3.2，会自动切回最早未完成的那一节）
     const res = callMainWorld('switchLesson', {
       mode: 'next',
       skipCompleted: S.settings.skipCompleted !== false,
@@ -571,7 +574,7 @@
       S.nextLockUntil = now() + 18000;
       S.stats.nextClicked++;
       saveStats();
-      log('已切换到下一节：', res.name);
+      log('已切换到下一未完成节：', res.name);
       setTimeout(() => {
         if (S.settings.enabled && S.settings.keepPlaying && !S.quizOpen) {
           const v = ensureVideo();
@@ -597,6 +600,18 @@
     const idx = items.findIndex(isActiveChapter);
     if (idx < 0) return;
 
+    if (S.settings.skipCompleted !== false) {
+      const firstUnfinishedDom = items.find((el, i) => i !== idx && !isDoneChapter(el));
+      if (firstUnfinishedDom) {
+        S.nextLockUntil = now() + 18000;
+        clickEl(firstUnfinishedDom);
+        S.stats.nextClicked++;
+        saveStats();
+        log('切到未完成节（DOM）：', (textOf(firstUnfinishedDom) || '').slice(0, 40));
+        return;
+      }
+    }
+
     for (let i = idx + 1; i < items.length; i++) {
       if (S.settings.skipCompleted && isDoneChapter(items[i])) continue;
       S.nextLockUntil = now() + 18000;
@@ -610,7 +625,7 @@
 
   /**
    * 视频播放到末尾时的统一调度：
-   *  - 若当前节未完成（如只算了 74% 没有对勾），无论是否开启 autoNext，都从 00:00 重新播放当前节直至完成
+   *  - 若当前节未完成（如只算了 48%/61%/74% 没有对勾），无论是否开启 autoNext，都从 00:00 重新播放当前节直至完成
    *  - 若当前节已完成（有对勾）且开启了 autoNext，则切换到下一节
    */
   function scheduleEndCheck(delay) {
@@ -642,42 +657,76 @@
   }
 
   /**
-   * 打开课程页时，若当前默认加载的那一节已经是 100% 完成状态（.time_icofinish / isStudiedLesson===1），
-   * 自动通过 Vue 实例切换到第一个未完成的章节。
+   * 检查并跳转到最早未完成的章节：
+   *  1. 打开页面时，若当前默认加载的那一节已完成（curDone === true），跳到第一个未完成节
+   *  2. 若当前节之前存在尚未完成的小节（hasEarlierUnfinished === true，例如已在播 3.3 但 3.1/3.2 仍是 48%/61% 未出对勾），
+   *     自动切回最早未完成的小节（3.1）按顺序补刷完毕
    */
   function maybeJumpToUnfinished() {
-    if (S.jumpTried || !S.settings.enabled || !S.settings.skipCompleted) return;
+    if (!S.settings.enabled || !S.settings.skipCompleted) return;
+    if (S.quizOpen || now() < S.nextLockUntil) return;
     const elapsed = now() - S.startAt;
     if (elapsed < 3500) return;
 
     const st = callMainWorld('getState');
     if (st && st.hasVm && st.lessonCount > 0) {
-      if (!st.studyInfoReady && elapsed < 6500) return;
-      S.jumpTried = true;
+      if (!st.studyInfoReady && elapsed < 7500) return;
 
-      if (st.curDone) {
-        const res = callMainWorld('switchLesson', {
-          mode: 'unfinished',
-          skipCompleted: true,
-        });
-        if (res && res.ok) {
-          S.nextLockUntil = now() + 15000;
-          S.stats.nextClicked++;
-          saveStats();
-          log('当前章节已完成，自动跳转到未完成章节：', res.name);
-          setTimeout(() => {
-            const v = ensureVideo();
-            if (v && S.settings.keepPlaying) tryPlay(v);
-          }, 3000);
+      const needJump =
+        Boolean(st.hasEarlierUnfinished) || (!S.jumpTried && Boolean(st.curDone));
+
+      if (!needJump) {
+        if (!S.jumpTried) {
+          S.jumpTried = true;
+          log(`当前已在最早未完成章节：${st.curName || st.lastViewVideoId}（进度 ${st.curPercentage || 0}%）`);
         }
-      } else {
-        log(`当前已在未完成章节：${st.curName || st.lastViewVideoId}（进度 ${st.curPercentage || 0}%）`);
+        return;
+      }
+
+      S.jumpTried = true;
+      const res = callMainWorld('switchLesson', {
+        mode: 'unfinished',
+        skipCompleted: true,
+      });
+      if (res && res.ok) {
+        S.nextLockUntil = now() + 15000;
+        S.replayingVideoId = '';
+        S.replayCount = 0;
+        S.stats.nextClicked++;
+        saveStats();
+        if (st.hasEarlierUnfinished) {
+          log(`检测到前面仍有未完成小节，自动切回补刷：${res.name}`);
+        } else {
+          log('当前章节已完成，自动跳转到未完成章节：', res.name);
+        }
+        setTimeout(() => {
+          const v = ensureVideo();
+          if (v && S.settings.keepPlaying) tryPlay(v);
+        }, 3000);
       }
       return;
     }
 
-    if (elapsed >= 7000) {
-      S.jumpTried = true;
+    // DOM 兜底
+    if (!S.jumpTried && elapsed >= 6500) {
+      const items = chapterItems();
+      if (items.length) {
+        S.jumpTried = true;
+        const activeIdx = items.findIndex(isActiveChapter);
+        const firstUnfinishedIdx = items.findIndex((el) => !isDoneChapter(el));
+        if (
+          firstUnfinishedIdx >= 0 &&
+          activeIdx >= 0 &&
+          firstUnfinishedIdx !== activeIdx &&
+          (isDoneChapter(items[activeIdx]) || activeIdx > firstUnfinishedIdx)
+        ) {
+          S.nextLockUntil = now() + 15000;
+          clickEl(items[firstUnfinishedIdx]);
+          S.stats.nextClicked++;
+          saveStats();
+          log('自动跳转到最早未完成章节（DOM）：', (textOf(items[firstUnfinishedIdx]) || '').slice(0, 40));
+        }
+      }
     }
   }
 
@@ -848,10 +897,36 @@
     } catch (e) {}
   }
 
+  /**
+   * 与后台 Service Worker 建立长连接，接收每 2s 一次的不受后台节流影响的心跳，
+   * 确保标签页在后台时依然能准时驱动计时补偿与状态检测。
+   */
+  function connectKeepAlivePort() {
+    let port = null;
+    function connect() {
+      try {
+        port = chrome.runtime.connect({ name: 'zhs-keepalive' });
+        port.onMessage.addListener((msg) => {
+          if (msg && msg.type === 'heartbeat') {
+            tick();
+          }
+        });
+        port.onDisconnect.addListener(() => {
+          port = null;
+          setTimeout(connect, 2000);
+        });
+      } catch (e) {
+        setTimeout(connect, 5000);
+      }
+    }
+    connect();
+  }
+
   async function init() {
     await loadState();
     bindStorage();
     bindMessaging();
+    connectKeepAlivePort();
     bindObserver();
     window.__ZHS_STATUS__ = () => statusPayload();
     setInterval(tick, 900);

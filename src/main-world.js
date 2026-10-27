@@ -1,15 +1,17 @@
 /**
- * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.4.1）。
+ * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.4.2）。
  *
  * 核心职责：
  *  1. 伪装页面可见性（hidden / visibilityState / hasFocus），切后台不暂停。
  *  2. 在页面冻结 window.originFunction 之前保护 Function.prototype.toString，
  *     防止其他扩展改写 XMLHttpRequest / addEventListener 或注入 window.OCS 导致 60s 环境自检（checkout）误报。
- *  3. 捕获并接管智慧树 stuStudy 的 Vue 组件实例（vm）：
+ *  3. 阻止页面抹除 DOM 节点上的 __vue__ 引用，捕获并接管智慧树 stuStudy 的 Vue 组件实例（vm）：
  *     - 屏蔽 notTrustScript / collectLog / checkout / 异常脚本弹窗
  *     - 将 topicClick / closeTest / videoClick 的 isTrusted 校验安全放行
- *     - 补偿后台标签页 setInterval 节流，防止视频播完但学习时长（totalStudyTime）只记了 70%+
- *     - 提供原生 Vue 级别的弹题作答、安全关窗、未完成重播（replayCurrent）、切换章节接口
+ *     - 接管 videoNext：播放器触发切集时若当前小节未出对勾，强制重播当前节而非切走
+ *     - 队列化保护 saveDdsjkTimeInWhileFn：防止 isSaving 期间（如 3 分钟缓存上报时）丢失入库保存
+ *     - 精确按真实挂钟时间（Wall-Clock）多步补偿后台标签页 setInterval 节流，确保后台刷课时 watchPointPost 与 totalStudyTime 100% 同步累加
+ *     - 提供原生 Vue 级别的弹题作答、安全关窗、未完成重播（replayCurrent）、按序补刷切集接口
  *  4. 在 window 捕获阶段拦截落入 #container 的非可信点击，避免触发播放器容器的捕获监听。
  */
 (() => {
@@ -121,10 +123,15 @@
   } catch (e) {}
 
   // ==================== 4. 捕获并接管 stuStudy Vue 实例 ====================
+  let rootVueVm = null;
   let stuStudyVm = null;
   const patchedVms = new WeakSet();
   let lastStudyTickAt = 0;
   let lastRecordTickAt = 0;
+  let lastTrackedVideoId = '';
+  let inCompensatingTick = false;
+  let pendingDbSaveArgs = null;
+  let pendingDbSaveTimer = null;
 
   function isStuStudyVm(vm) {
     return Boolean(
@@ -134,6 +141,23 @@
           typeof vm.videoClick === 'function' ||
           typeof vm.notTrustScript === 'function')
     );
+  }
+
+  function syncCurrentLessonStudyTime(vm) {
+    if (!vm || !Array.isArray(vm.videoList)) return;
+    try {
+      const total = Number(vm.totalStudyTime) || 0;
+      const lessons = getPlayableLessons(vm);
+      const cur = lessons.find((x) => x.videoId === vm.lastViewVideoId);
+      if (cur && cur.raw) {
+        if (typeof cur.raw.studyTotalTime !== 'number' || isNaN(cur.raw.studyTotalTime)) {
+          cur.raw.studyTotalTime = 0;
+        }
+        if (total > cur.raw.studyTotalTime) {
+          cur.raw.studyTotalTime = total;
+        }
+      }
+    } catch (e) {}
   }
 
   function patchVm(vm) {
@@ -185,7 +209,7 @@
             const list = this.topicInfo && this.topicInfo.lessonTestQuestionUseInterfaceDtos;
             if (Array.isArray(list)) {
               for (const q of list) {
-                if (!q.isCheck) {
+                if (q && !q.isCheck) {
                   q.isCheck = true;
                 }
               }
@@ -208,20 +232,77 @@
         };
       }
 
-      // 6) 记录学习计时器心跳时间，用于后台标签页节流补偿
+      // 6) 包装 videoNext / playerNext：当播放器内部触发切下一集时，若当前小节未完成（无对勾），强制重播当前集
+      if (typeof vm.videoNext === 'function') {
+        vm.videoNext = function () {
+          const st = getVmState();
+          if (st && st.hasVm && !st.curDone) {
+            console.log(TAG, '拦截播放器自动 videoNext：当前小节尚未完成，改为从头重播当前节');
+            replayCurrentLesson();
+            return;
+          }
+          switchLesson('next', true, false);
+        };
+      }
+
+      // 7) 包装 saveDdsjkTimeInWhileFn：防止在 isSaving（如 3 分钟缓存保存）期间调用导致丢失入库请求或卡住切集
+      if (typeof vm.saveDdsjkTimeInWhileFn === 'function') {
+        const origSaveDb = vm.saveDdsjkTimeInWhileFn;
+        vm.saveDdsjkTimeInWhileFn = function (...args) {
+          if (this.isSaving) {
+            pendingDbSaveArgs = args;
+            if (!pendingDbSaveTimer) {
+              pendingDbSaveTimer = setInterval(() => {
+                if (!this.isSaving && pendingDbSaveArgs) {
+                  const nextArgs = pendingDbSaveArgs;
+                  pendingDbSaveArgs = null;
+                  clearInterval(pendingDbSaveTimer);
+                  pendingDbSaveTimer = null;
+                  try {
+                    if ((Number(this.playTimes) || 0) <= 5 && !nextArgs[4]) {
+                      this.playTimes = Math.max(10, Number(this.playTimes) || 10);
+                    }
+                    origSaveDb.apply(this, nextArgs);
+                  } catch (e) {}
+                }
+              }, 250);
+            }
+            return;
+          }
+          return origSaveDb.apply(this, args);
+        };
+      }
+
+      // 8) 包装学习计时器心跳函数，用于后台标签页精确补偿
       if (typeof vm.totalStudyTimeFun === 'function') {
         const origTotalStudyTimeFun = vm.totalStudyTimeFun;
+        vm.__origTotalStudyTimeFun = origTotalStudyTimeFun;
         vm.totalStudyTimeFun = function (...args) {
-          lastStudyTickAt = Date.now();
-          return origTotalStudyTimeFun.apply(this, args);
+          if (!inCompensatingTick) {
+            lastStudyTickAt = Date.now();
+          }
+          syncCurrentLessonStudyTime(this);
+          const res = origTotalStudyTimeFun.apply(this, args);
+          syncCurrentLessonStudyTime(this);
+          return res;
         };
       }
       if (typeof vm.learningTimeRecord === 'function') {
         const origLearningTimeRecord = vm.learningTimeRecord;
+        vm.__origLearningTimeRecord = origLearningTimeRecord;
         vm.learningTimeRecord = function (...args) {
-          lastRecordTickAt = Date.now();
+          if (!inCompensatingTick) {
+            lastRecordTickAt = Date.now();
+          }
           return origLearningTimeRecord.apply(this, args);
         };
+      }
+
+      // 若接管前计时器已启动，重启一次使 setInterval 绑定到包装后的函数
+      if (vm.totalStudyTimeInterval && typeof vm.startTotalTimer === 'function') {
+        try {
+          vm.startTotalTimer();
+        } catch (e) {}
       }
 
       console.log(TAG, '已接管并保护 stuStudy Vue 实例');
@@ -232,17 +313,25 @@
     return vm;
   }
 
-  // 在页面 mounted 抹掉 el.__vue__ 之前捕获实例
+  // 阻止页面通过 Object.defineProperty(el, '__vue__', { get(){}, set(){} }) 抹除 __vue__，并第一时间捕获实例
   try {
     const origDefineProperty = Object.defineProperty;
     Object.defineProperty = function (target, prop, descriptor) {
       if (prop === '__vue__' && target && target instanceof Element) {
         try {
           const existing = target.__vue__;
-          if (isStuStudyVm(existing)) {
-            patchVm(existing);
+          if (existing && typeof existing === 'object') {
+            if (existing.$root) rootVueVm = existing.$root;
+            else if (!rootVueVm) rootVueVm = existing;
+            if (isStuStudyVm(existing)) {
+              patchVm(existing);
+            }
           }
         } catch (e) {}
+        // 阻止页面用空 getter/setter 抹掉 DOM 上的 __vue__
+        if (descriptor && typeof descriptor.get === 'function' && !('value' in descriptor)) {
+          return target;
+        }
       }
       return origDefineProperty.call(this, target, prop, descriptor);
     };
@@ -260,8 +349,12 @@
       return stuStudyVm;
     }
     try {
+      const videoStudyEl = document.querySelector('.video-study');
+      if (videoStudyEl && isStuStudyVm(videoStudyEl.__vue__)) {
+        return patchVm(videoStudyEl.__vue__);
+      }
       const appEl = document.getElementById('app');
-      const root = appEl && appEl.__vue__;
+      const root = (appEl && appEl.__vue__) || rootVueVm || (videoStudyEl && videoStudyEl.__vue__ && videoStudyEl.__vue__.$root);
       if (!root) return null;
       const queue = [root];
       const visited = new Set();
@@ -316,6 +409,7 @@
               state: Number(small.isStudiedLesson) || 0,
               percentage: Number(small.percentage) || 0,
               studyTotalTime: Number(small.studyTotalTime) || 0,
+              hasStudyInfo: typeof small.studyTotalTime === 'number',
               videoSec: Number(small.videoSec) || 0,
               raw: small,
               args: [chapter, chapIdx, lesson, lessonIdx, small, smallIdx],
@@ -329,6 +423,7 @@
             state: Number(lesson.isStudiedLesson) || 0,
             percentage: Number(lesson.percentage) || 0,
             studyTotalTime: Number(lesson.studyTotalTime) || 0,
+            hasStudyInfo: typeof lesson.studyTotalTime === 'number',
             videoSec: Number(lesson.videoSec) || 0,
             raw: lesson,
             args: [chapter, chapIdx, lesson, lessonIdx, null, null],
@@ -347,7 +442,13 @@
     const lessons = getPlayableLessons(vm);
     const curIdx = lessons.findIndex((x) => x.videoId === vm.lastViewVideoId);
     const curLesson = curIdx >= 0 ? lessons[curIdx] : null;
-    const studyInfoReady = lessons.some((x) => x.state > 0 || x.percentage > 0);
+    const studyInfoReady = lessons.some((x) => x.hasStudyInfo || x.state > 0 || x.percentage > 0);
+
+    const firstUnfinishedIdx = lessons.findIndex((x) => !x.done);
+    const firstUnfinished = firstUnfinishedIdx >= 0 ? lessons[firstUnfinishedIdx] : null;
+    const hasEarlierUnfinished = Boolean(
+      studyInfoReady && firstUnfinishedIdx >= 0 && curIdx > firstUnfinishedIdx
+    );
 
     const dtos =
       (vm.topicInfo &&
@@ -382,6 +483,9 @@
       curVideoSec: curLesson ? curLesson.videoSec : 0,
       curName: curLesson ? curLesson.name : '',
       studyInfoReady,
+      firstUnfinishedIdx,
+      firstUnfinishedName: firstUnfinished ? firstUnfinished.name : '',
+      hasEarlierUnfinished,
     };
   }
 
@@ -519,7 +623,7 @@
   }
 
   /**
-   * 当前视频播放到底但尚未完成（如卡在 74% 未出现对勾）时，从 00:00 重新播放当前视频，
+   * 当前视频播放到底但尚未完成（如卡在 48%/61%/74% 未出现对勾）时，从 00:00 重新播放当前视频，
    * 并确保 totalStudyTime 在已有基础上继续累加直到触发 computeProgree 满额完成。
    */
   function replayCurrentLesson() {
@@ -530,8 +634,18 @@
       try {
         const lessons = getPlayableLessons(vm);
         const cur = lessons.find((x) => x.videoId === vm.lastViewVideoId);
-        if (cur && cur.studyTotalTime > (Number(vm.totalStudyTime) || 0)) {
-          vm.totalStudyTime = cur.studyTotalTime;
+        if (cur) {
+          const bestTime = Math.max(
+            Number(vm.totalStudyTime) || 0,
+            Number(cur.studyTotalTime) || 0,
+            Math.floor(((Number(cur.percentage) || 0) / 100) * (Number(cur.videoSec) || 0))
+          );
+          if (bestTime > (Number(vm.totalStudyTime) || 0)) {
+            vm.totalStudyTime = bestTime;
+          }
+          if (cur.raw && bestTime > (Number(cur.raw.studyTotalTime) || 0)) {
+            cur.raw.studyTotalTime = bestTime;
+          }
         }
       } catch (e) {}
     }
@@ -565,19 +679,27 @@
       ) {
         vm.startTotalTimer();
       }
+      lastStudyTickAt = Date.now();
+      lastRecordTickAt = Date.now();
     } catch (e) {}
 
     return { ok: true };
   }
 
   /**
-   * 强制触发一次学习进度入库保存（用于重播刚变成对勾后确保服务端落库）。
+   * 强制触发一次学习进度入库保存（用于重播或刚变成对勾后确保服务端落库）。
    */
   function flushStudyProgress() {
     const vm = findVmFromRoot();
     if (!vm) return { ok: false };
     try {
-      if (!vm.isSaving && (Number(vm.playTimes) || 0) > 0 && typeof vm.saveDdsjkTimeInWhileFn === 'function') {
+      if (typeof vm.saveDdsjkTimeInWhileFn === 'function') {
+        if ((Number(vm.playTimes) || 0) <= 5) {
+          vm.playTimes = Math.max(10, Number(vm.playTimes) || 10);
+        }
+        if (!vm.watchPointPost && typeof vm.learningTimeRecord === 'function') {
+          vm.learningTimeRecord();
+        }
         vm.saveDdsjkTimeInWhileFn(null, null, null, 2, true);
         return { ok: true, triggered: true };
       }
@@ -600,16 +722,15 @@
 
     let target = null;
     if (mode === 'unfinished') {
-      // 如果当前节尚未完成，留在当前节继续播完
-      if (curLesson && !curDone) {
+      // 始终从课程第 1 节开始查找第一个未完成的小节（例如当前在 3.3，但 3.1/3.2 还没拿对勾，优先切回 3.1）
+      const firstUnfinished = lessons.find((x) => !x.done) || null;
+      if (!firstUnfinished) {
+        return { ok: false, reason: 'all_finished' };
+      }
+      if (curLesson && firstUnfinished.videoId === curLesson.videoId && !curDone) {
         return { ok: false, reason: 'current_already_unfinished', current: curLesson.name };
       }
-      if (curIdx >= 0) {
-        target = lessons.slice(curIdx + 1).find((x) => !x.done) || null;
-      }
-      if (!target) {
-        target = lessons.find((x) => !x.done) || null;
-      }
+      target = firstUnfinished;
     } else {
       // mode === 'next'：切换下一集前，若当前集还没拿到对勾（未完成），拒绝切走并提示重播当前集
       if (!force && curLesson && !curDone) {
@@ -621,14 +742,14 @@
         };
       }
 
-      const startIdx = curIdx >= 0 ? curIdx + 1 : 0;
-      for (let i = startIdx; i < lessons.length; i++) {
-        if (skipCompleted && lessons[i].done) continue;
-        target = lessons[i];
-        break;
-      }
-      if (!target && skipCompleted) {
-        target = lessons.slice(0, Math.max(0, curIdx)).find((x) => !x.done) || null;
+      if (skipCompleted) {
+        // 优先检查前面是否有遗漏未完成的小节（如 3.1 / 3.2），确保严格按顺序全部拿到对勾
+        target = lessons.find((x) => !x.done && (!curLesson || x.videoId !== curLesson.videoId)) || null;
+      } else {
+        const startIdx = curIdx >= 0 ? curIdx + 1 : 0;
+        if (startIdx < lessons.length) {
+          target = lessons[startIdx];
+        }
       }
     }
 
@@ -639,6 +760,8 @@
     try {
       vm.repeatClick = true;
       vm.videoClick(...target.args);
+      lastStudyTickAt = Date.now();
+      lastRecordTickAt = Date.now();
       return { ok: true, name: target.name, videoId: target.videoId };
     } catch (e) {
       return { ok: false, reason: String(e && e.message ? e.message : e) };
@@ -661,7 +784,7 @@
 
     try {
       const v = document.querySelector('#container video, video.vjs-tech, video');
-      if (v && v.paused && !v.ended) {
+      if (v && v.paused && !v.ended && (!vm || !vm.testDialog)) {
         const p = v.play();
         if (p && typeof p.catch === 'function') p.catch(() => {});
         played = true;
@@ -674,20 +797,47 @@
         !vm.testDialog &&
         (!vm.data || vm.data.studyStatus != 1)
       ) {
+        if (vm.lastViewVideoId && vm.lastViewVideoId !== lastTrackedVideoId) {
+          lastTrackedVideoId = vm.lastViewVideoId;
+          lastStudyTickAt = Date.now();
+          lastRecordTickAt = Date.now();
+        }
+
         if (!vm.totalStudyTimeInterval && typeof vm.startTotalTimer === 'function') {
           vm.startTotalTimer();
         }
-        // 补偿后台标签页 setInterval 节流：若真实播放中超过 5.2s 未触发 totalStudyTimeFun，主动补触发一次
+
+        syncCurrentLessonStudyTime(vm);
+
+        // 按真实挂钟时间（Wall-Clock）多步补偿后台标签页被节流的计时器
         const t = Date.now();
-        if (lastStudyTickAt > 0 && t - lastStudyTickAt >= 5200 && typeof vm.totalStudyTimeFun === 'function') {
-          vm.totalStudyTimeFun();
-        } else if (lastStudyTickAt === 0) {
+        if (lastStudyTickAt <= 0 || t - lastStudyTickAt > 120000) {
           lastStudyTickAt = t;
-        }
-        if (lastRecordTickAt > 0 && t - lastRecordTickAt >= 2200 && typeof vm.learningTimeRecord === 'function') {
-          vm.learningTimeRecord();
-        } else if (lastRecordTickAt === 0) {
           lastRecordTickAt = t;
+        } else {
+          let steps = 0;
+          inCompensatingTick = true;
+          try {
+            while (t - lastStudyTickAt >= 4990 && steps < 12) {
+              lastStudyTickAt += 4990;
+              steps++;
+              if (typeof vm.learningTimeRecord === 'function') {
+                vm.learningTimeRecord();
+                vm.learningTimeRecord();
+              }
+              if (typeof vm.totalStudyTimeFun === 'function') {
+                vm.totalStudyTimeFun();
+              }
+            }
+            if (steps > 0) {
+              lastRecordTickAt = t;
+            } else if (t - lastRecordTickAt >= 2000 && typeof vm.learningTimeRecord === 'function') {
+              lastRecordTickAt = t;
+              vm.learningTimeRecord();
+            }
+          } finally {
+            inCompensatingTick = false;
+          }
         }
       }
     } catch (e) {}
@@ -752,5 +902,5 @@
     } catch (e) {}
   });
 
-  console.log(TAG, 'MAIN world 防检测与 Vue 接管模块已就绪 (v0.4.1)');
+  console.log(TAG, 'MAIN world 防检测与 Vue 接管模块已就绪 (v0.4.2)');
 })();
