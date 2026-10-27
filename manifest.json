@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "智慧树自动刷课",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "自动播放智慧树共享课视频、自动作答弹题、未满进度自动重播、自动切换下一节。",
   "permissions": ["storage"],
   "host_permissions": ["*://studyvideoh5.zhihuishu.com/*"],

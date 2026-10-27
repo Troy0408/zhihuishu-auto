@@ -1,5 +1,5 @@
 /**
- * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.4.2）。
+ * MAIN world 脚本：在 document_start（页面内联 <script> 之前）运行（v0.4.3）。
  *
  * 核心职责：
  *  1. 伪装页面可见性（hidden / visibilityState / hasFocus），切后台不暂停。
@@ -9,9 +9,11 @@
  *     - 屏蔽 notTrustScript / collectLog / checkout / 异常脚本弹窗
  *     - 将 topicClick / closeTest / videoClick 的 isTrusted 校验安全放行
  *     - 接管 videoNext：播放器触发切集时若当前小节未出对勾，强制重播当前节而非切走
- *     - 队列化保护 saveDdsjkTimeInWhileFn：防止 isSaving 期间（如 3 分钟缓存上报时）丢失入库保存
- *     - 精确按真实挂钟时间（Wall-Clock）多步补偿后台标签页 setInterval 节流，确保后台刷课时 watchPointPost 与 totalStudyTime 100% 同步累加
- *     - 提供原生 Vue 级别的弹题作答、安全关窗、未完成重播（replayCurrent）、按序补刷切集接口
+ *     - 队列化保护 saveDdsjkTimeInWhileFn：防止 isSaving 期间丢失入库请求
+ *     - 对 totalStudyTimeFun (4.8s 防重锁) 与 learningTimeRecord (1.8s 防重锁) 加硬性节流保护：
+ *       配合后台 Service Worker 1.5s 心跳，保证前后台均严格按 1x 真实时间单步触发，
+ *       绝不与页面原生 setInterval 重复叠加，避免触发服务端进度校验失败（backDialog）
+ *     - 若偶发网络波动弹出 backDialog（“因网络连接问题，导致学习进度提交失败”），自动关闭并重新同步当前小节状态继续播放
  *  4. 在 window 捕获阶段拦截落入 #container 的非可信点击，避免触发播放器容器的捕获监听。
  */
 (() => {
@@ -129,7 +131,6 @@
   let lastStudyTickAt = 0;
   let lastRecordTickAt = 0;
   let lastTrackedVideoId = '';
-  let inCompensatingTick = false;
   let pendingDbSaveArgs = null;
   let pendingDbSaveTimer = null;
 
@@ -143,19 +144,13 @@
     );
   }
 
-  function syncCurrentLessonStudyTime(vm) {
+  function ensureLessonStudyTotalTimeInit(vm) {
     if (!vm || !Array.isArray(vm.videoList)) return;
     try {
-      const total = Number(vm.totalStudyTime) || 0;
       const lessons = getPlayableLessons(vm);
       const cur = lessons.find((x) => x.videoId === vm.lastViewVideoId);
-      if (cur && cur.raw) {
-        if (typeof cur.raw.studyTotalTime !== 'number' || isNaN(cur.raw.studyTotalTime)) {
-          cur.raw.studyTotalTime = 0;
-        }
-        if (total > cur.raw.studyTotalTime) {
-          cur.raw.studyTotalTime = total;
-        }
+      if (cur && cur.raw && (typeof cur.raw.studyTotalTime !== 'number' || isNaN(cur.raw.studyTotalTime))) {
+        cur.raw.studyTotalTime = 0;
       }
     } catch (e) {}
   }
@@ -259,9 +254,6 @@
                   clearInterval(pendingDbSaveTimer);
                   pendingDbSaveTimer = null;
                   try {
-                    if ((Number(this.playTimes) || 0) <= 5 && !nextArgs[4]) {
-                      this.playTimes = Math.max(10, Number(this.playTimes) || 10);
-                    }
                     origSaveDb.apply(this, nextArgs);
                   } catch (e) {}
                 }
@@ -273,32 +265,33 @@
         };
       }
 
-      // 8) 包装学习计时器心跳函数，用于后台标签页精确补偿
+      // 8) 包装学习计时器心跳函数：加入硬性最小间隔防重锁（4.8s / 1.8s），
+      //    确保后台心跳唤醒与页面原生 setInterval 绝不重复叠加导致 playTimes 超速报错
       if (typeof vm.totalStudyTimeFun === 'function') {
         const origTotalStudyTimeFun = vm.totalStudyTimeFun;
-        vm.__origTotalStudyTimeFun = origTotalStudyTimeFun;
         vm.totalStudyTimeFun = function (...args) {
-          if (!inCompensatingTick) {
-            lastStudyTickAt = Date.now();
+          const t = Date.now();
+          if (lastStudyTickAt > 0 && t - lastStudyTickAt < 4800) {
+            return;
           }
-          syncCurrentLessonStudyTime(this);
-          const res = origTotalStudyTimeFun.apply(this, args);
-          syncCurrentLessonStudyTime(this);
-          return res;
+          lastStudyTickAt = t;
+          ensureLessonStudyTotalTimeInit(this);
+          return origTotalStudyTimeFun.apply(this, args);
         };
       }
       if (typeof vm.learningTimeRecord === 'function') {
         const origLearningTimeRecord = vm.learningTimeRecord;
-        vm.__origLearningTimeRecord = origLearningTimeRecord;
         vm.learningTimeRecord = function (...args) {
-          if (!inCompensatingTick) {
-            lastRecordTickAt = Date.now();
+          const t = Date.now();
+          if (lastRecordTickAt > 0 && t - lastRecordTickAt < 1800) {
+            return;
           }
+          lastRecordTickAt = t;
           return origLearningTimeRecord.apply(this, args);
         };
       }
 
-      // 若接管前计时器已启动，重启一次使 setInterval 绑定到包装后的函数
+      // 若接管前计时器已启动，重启一次使 setInterval 绑定到包装后的防重函数
       if (vm.totalStudyTimeInterval && typeof vm.startTotalTimer === 'function') {
         try {
           vm.startTotalTimer();
@@ -469,6 +462,7 @@
       imgDialog: Boolean(vm.imgDialog),
       lookHabitDialog: Boolean(vm.lookHabitDialog),
       readDialog: Boolean(vm.readDialog),
+      backDialog: Boolean(vm.backDialog),
       tipsDialog: Boolean(vm.tipsDialog),
       tipsMsg: vm.tipsMsg || '',
       faceVisible: Boolean(vm.FaceVisible || vm.FaceIdentityVisible),
@@ -618,37 +612,31 @@
         else vm.readDialog = false;
         closed.push('readDialog');
       }
+      if (vm.backDialog) {
+        vm.backDialog = false;
+        closed.push('backDialog');
+        // 重新向服务端同步当前小节的 studyTotalTime 与 token，避免后续提交继续失步
+        try {
+          const lessons = getPlayableLessons(vm);
+          const cur = lessons.find((x) => x.videoId === vm.lastViewVideoId);
+          if (cur && typeof vm.prelearningNote === 'function') {
+            vm.playTimes = 0;
+            vm.watchPointPost = '';
+            vm.prelearningNote(cur.args[0], cur.args[2], cur.args[4]);
+          }
+        } catch (e) {}
+      }
     } catch (e) {}
     return { closed };
   }
 
   /**
    * 当前视频播放到底但尚未完成（如卡在 48%/61%/74% 未出现对勾）时，从 00:00 重新播放当前视频，
-   * 并确保 totalStudyTime 在已有基础上继续累加直到触发 computeProgree 满额完成。
+   * 不擅自篡改 totalStudyTime / playTimes，保持与服务端校验完全一致。
    */
   function replayCurrentLesson() {
     const vm = findVmFromRoot();
     const v = document.querySelector('#container video, video.vjs-tech, video');
-
-    if (vm) {
-      try {
-        const lessons = getPlayableLessons(vm);
-        const cur = lessons.find((x) => x.videoId === vm.lastViewVideoId);
-        if (cur) {
-          const bestTime = Math.max(
-            Number(vm.totalStudyTime) || 0,
-            Number(cur.studyTotalTime) || 0,
-            Math.floor(((Number(cur.percentage) || 0) / 100) * (Number(cur.videoSec) || 0))
-          );
-          if (bestTime > (Number(vm.totalStudyTime) || 0)) {
-            vm.totalStudyTime = bestTime;
-          }
-          if (cur.raw && bestTime > (Number(cur.raw.studyTotalTime) || 0)) {
-            cur.raw.studyTotalTime = bestTime;
-          }
-        }
-      } catch (e) {}
-    }
 
     try {
       if (typeof window.ablePlayerX === 'function') {
@@ -687,20 +675,18 @@
   }
 
   /**
-   * 强制触发一次学习进度入库保存（用于重播或刚变成对勾后确保服务端落库）。
+   * 仅当确实有未提交的有效观看时长（playTimes > 5）时才触发入库保存。
    */
   function flushStudyProgress() {
     const vm = findVmFromRoot();
     if (!vm) return { ok: false };
     try {
-      if (typeof vm.saveDdsjkTimeInWhileFn === 'function') {
-        if ((Number(vm.playTimes) || 0) <= 5) {
-          vm.playTimes = Math.max(10, Number(vm.playTimes) || 10);
-        }
-        if (!vm.watchPointPost && typeof vm.learningTimeRecord === 'function') {
-          vm.learningTimeRecord();
-        }
-        vm.saveDdsjkTimeInWhileFn(null, null, null, 2, true);
+      if (
+        !vm.isSaving &&
+        (Number(vm.playTimes) || 0) > 5 &&
+        typeof vm.saveDdsjkTimeInWhileFn === 'function'
+      ) {
+        vm.saveDdsjkTimeInWhileFn(null, null, null, 2);
         return { ok: true, triggered: true };
       }
       return { ok: true, triggered: false, isSaving: Boolean(vm.isSaving) };
@@ -775,7 +761,14 @@
       if (typeof window.ablePlayerX === 'function') {
         const player = window.ablePlayerX('container');
         const vCheck = document.querySelector('#container video, video.vjs-tech, video');
-        if (vCheck && vCheck.paused && !vCheck.ended && player && typeof player.play === 'function') {
+        if (
+          vCheck &&
+          vCheck.paused &&
+          !vCheck.ended &&
+          (!vm || !vm.testDialog) &&
+          player &&
+          typeof player.play === 'function'
+        ) {
           player.play();
           played = true;
         }
@@ -807,37 +800,24 @@
           vm.startTotalTimer();
         }
 
-        syncCurrentLessonStudyTime(vm);
+        ensureLessonStudyTotalTimeInit(vm);
 
-        // 按真实挂钟时间（Wall-Clock）多步补偿后台标签页被节流的计时器
+        // 单步安全补偿：仅当超过原生周期（2.0s / 5.1s）未触发时单次触发，
+        // 内部带有 1.8s / 4.8s 硬性防重锁，绝不超速或重复触发
         const t = Date.now();
-        if (lastStudyTickAt <= 0 || t - lastStudyTickAt > 120000) {
-          lastStudyTickAt = t;
+        if (lastRecordTickAt === 0) {
           lastRecordTickAt = t;
-        } else {
-          let steps = 0;
-          inCompensatingTick = true;
-          try {
-            while (t - lastStudyTickAt >= 4990 && steps < 12) {
-              lastStudyTickAt += 4990;
-              steps++;
-              if (typeof vm.learningTimeRecord === 'function') {
-                vm.learningTimeRecord();
-                vm.learningTimeRecord();
-              }
-              if (typeof vm.totalStudyTimeFun === 'function') {
-                vm.totalStudyTimeFun();
-              }
-            }
-            if (steps > 0) {
-              lastRecordTickAt = t;
-            } else if (t - lastRecordTickAt >= 2000 && typeof vm.learningTimeRecord === 'function') {
-              lastRecordTickAt = t;
-              vm.learningTimeRecord();
-            }
-          } finally {
-            inCompensatingTick = false;
+        } else if (t - lastRecordTickAt >= 2000 && typeof vm.learningTimeRecord === 'function') {
+          vm.learningTimeRecord();
+        }
+
+        if (lastStudyTickAt === 0) {
+          lastStudyTickAt = t;
+        } else if (t - lastStudyTickAt >= 5100 && typeof vm.totalStudyTimeFun === 'function') {
+          if (!vm.watchPointPost && typeof vm.learningTimeRecord === 'function') {
+            vm.learningTimeRecord();
           }
+          vm.totalStudyTimeFun();
         }
       }
     } catch (e) {}
@@ -902,5 +882,5 @@
     } catch (e) {}
   });
 
-  console.log(TAG, 'MAIN world 防检测与 Vue 接管模块已就绪 (v0.4.2)');
+  console.log(TAG, 'MAIN world 防检测与 Vue 接管模块已就绪 (v0.4.3)');
 })();

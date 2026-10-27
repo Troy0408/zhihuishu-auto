@@ -1,5 +1,5 @@
 /**
- * 智慧树共享课自动刷课 —— 内容脚本主体（v0.4.2）。
+ * 智慧树共享课自动刷课 —— 内容脚本主体（v0.4.3）。
  *
  * 核心机制：
  *   - 通过同步桥接调用 src/main-world.js 中已接管的 stuStudy Vue 实例（vm）：
@@ -560,7 +560,6 @@
       return;
     }
 
-    callMainWorld('flushProgress');
     S.replayingVideoId = '';
     S.replayCount = 0;
 
@@ -809,7 +808,7 @@
     }
 
     const st = callMainWorld('getState');
-    if (st && (st.imgDialog || st.lookHabitDialog || st.readDialog)) {
+    if (st && (st.imgDialog || st.lookHabitDialog || st.readDialog || st.backDialog)) {
       clickResumePrompt();
     }
 

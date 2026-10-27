@@ -1,10 +1,10 @@
 /**
- * 后台 Service Worker（MV3，v0.4.2）
+ * 后台 Service Worker（MV3，v0.4.3）
  * 职责：
  *  1. 首次安装时写入默认配置
  *  2. 给工具栏图标显示开关状态
- *  3. 维护与内容脚本的长连接（zhs-keepalive），每 2s 发送一次不受后台标签页节流影响的心跳，
- *     驱动后台标签页持续补偿学习时长计时器与完课状态检测
+ *  3. 维护与内容脚本的长连接（zhs-keepalive），每 1.5s 发送一次不受后台标签页节流影响的心跳，
+ *     驱动后台标签页按 1x 真实时间触发学习时长计时器与完课状态检测
  */
 
 const DEFAULTS = {
@@ -38,7 +38,7 @@ function ensureHeartbeat() {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
       }
-    }, 2000);
+    }, 1500);
   } else if (activePorts.size === 0 && heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;

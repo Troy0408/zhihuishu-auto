@@ -13,7 +13,7 @@
  * 平台改版时优先改这里。
  */
 window.ZHS_CONFIG = {
-  version: '0.4.2',
+  version: '0.4.3',
 
   selectors: {
     video: ['#container video', 'video.vjs-tech', 'video'],
