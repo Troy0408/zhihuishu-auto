@@ -1,187 +1,124 @@
-# 智慧树自动刷课（自用扩展）v0.4.1
+# 智慧树自动刷课 (zhihuishu-auto)
 
-一个只在本机运行的 Chrome / Edge 扩展（MV3），针对 **studyvideoh5.zhihuishu.com** 的共享课播放页：
+一款轻量、纯净、无需配置题库的 **Chrome / Edge 浏览器扩展（Manifest V3）**，专为智慧树（知到）共享课学习页（`studyvideoh5.zhihuishu.com`）设计。
 
-- 自动播放、自动静音，卡住/被暂停时自动恢复
-- 播放中弹出「弹题」时自动识别正确选项（`result === 1`，支持单选/多选/判断/多题连弹），答完安全关闭弹窗继续播放
-- 一节播完自动切下一节，自动跳过已完成（`100%`）的章节；打开页面若当前节已完成，自动切到未完成章节
-- **未满重播补刷**：若某节视频播到底但实际结算未完成（如只算了 `74%` 未出现蓝色完成对勾），自动从 `00:00` 重新播放该节，直到出现完成对勾并落库后再切下一节
-- 切到后台 / 最小化时，保持视频继续播放，并通过媒体 `timeupdate` 事件补偿后台标签页计时器节流
-
-v0.2 已用真实保存的课程页 HTML 校准过选择器，不再是猜测。
-
-v0.4.0 针对 `stuStudy.js` 与 `app.js` 的全部 5 处反脚本检测做了完整逆向与彻底绕过（详见第七节）。
-
-> 只操作你自己的浏览器和账号；不联网、不上传数据，仅申请了 `storage` 权限。
-> 课程页自己的弹题提示写着「弹题是为了帮助同学们巩固知识点，不会影响到大家作业和考试的成绩」，
-> 但平台仍可能对自动化行为做风控，是否用于重要课程/主账号请自行判断。
+所有逻辑均在本地浏览器运行，不联网、不收集任何个人数据，仅使用 `chrome.storage.local` 保存开关配置与本地统计。
 
 ---
 
-## 一、安装
+## ✨ 功能特性
 
-> 需要 Chrome 111+ 或 Edge 111+（用了 content script 的 `world: "MAIN"`）。
-
-### Chrome
-
-1. 打开 `chrome://extensions`
-2. 右上角打开「开发者模式」
-3. 点「加载已解压的扩展程序」
-4. 选择本文件夹 `zhihuishu-auto`
-5. 工具栏出现拼图图标 → 固定「智慧树自动刷课」
-
-### Edge
-
-1. 打开 `edge://extensions`
-2. 左下角打开「开发人员模式」
-3. 点「加载解压缩的扩展」
-4. 选择本文件夹
-5. 固定到工具栏
+- **自动播放与静音**：进入课程页后自动静音并开始播放，遇到缓冲、意外暂停或习惯提醒弹窗时自动恢复。
+- **弹题自动满分作答**：直接从页面 Vue 实例数据中读取标准答案（`result === 1`），支持单选题、多选题、判断题及多题连弹，作答后安全关闭弹窗并继续播放。
+- **未满进度自动重播补刷**：当视频播放到末尾但实际结算进度未达标（例如只结算到 `74%`、右侧目录未出现蓝色完成对勾 `.time_icofinish`）时，自动从 `00:00` 重新播放当前小节，直到拿到完成对勾并落库保存后再切换下一集。
+- **自动切换未完成章节**：当前小节完成后自动切换到下一未完成小节；打开页面时若默认停留在已完成小节，自动跳转到第一个未完成小节（自动跳过「平时测试」等非视频项）。
+- **后台 / 最小化防暂停与计时补偿**：伪装页面前台可见与焦点状态，并利用媒体线程 `timeupdate` 事件补偿后台标签页 `setInterval` 节流，防止后台挂机时学习时长少记。
+- **内置反检测保护**：接管页面 `stuStudy` Vue 组件实例与原生函数自检，彻底规避「检测到异常脚本」拦截。
 
 ---
 
-## 二、使用
+## 📦 安装方法
 
-1. 打开课程学习页（形如 `https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=...`）
-2. 点一下播放，让播放器加载出视频
-3. 点扩展图标，确认状态是「播放中 x:xx / y:yy」
-4. 之后可以切到别的标签页或最小化
+> **环境要求**：Chrome 111+ 或 Edge 111+（依赖 Manifest V3 的 `world: "MAIN"` 内容脚本支持）。
 
-| 选项 | 说明 |
-| --- | --- |
-| 总开关 | 关闭后扩展什么都不做 |
-| 自动静音 | 每 0.9s 检查一次 `video.muted`，被平台改回来会重新静音 |
-| 播完自动下一节 | 播完 4 秒后，若视频仍停在结尾，就点章节列表里的下一节 |
-| 跳过已完成章节 | 已完成的节（有对勾图标 `.time_icofinish`）自动跳过；打开页面时若当前节已完成，会跳到后面第一个未完成节 |
-| 切后台/最小化继续播 | 伪装页面可见 + 有焦点，并自动点「继续观看」类提示 |
-| 自动答弹题 | 检测 `#playTopic-dialog`，点选项、等判定、点关闭 |
-| 答题策略 | 「顺序尝试」每次换一个选项 / 「随机选」 |
-| 右下角状态角标 | 可选，方便确认在运行 |
+### 1. 获取源码
 
-统计（已答弹题 / 切换章节 / 恢复播放）存在 `chrome.storage.local`，可点「重置统计」清零。
+克隆本仓库，或在页面右上角点击 **Code → Download ZIP** 下载并解压到本地任意目录：
 
----
-
-## 三、实测页面结构（v0.2 依据）
-
-保存的页面是 `https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=...`，关键结构：
-
-**播放器**：video.js
-```html
-<video id="vjs_container_html5_api" class="vjs-tech" src="https://wsvideo.zhihuishu.com/...mp4">
+```bash
+git clone https://github.com/Troy0408/zhihuishu-auto.git
 ```
 
-**弹题弹窗**
-```html
-<div id="playTopic-dialog" class="el-dialog__wrapper dialog-test">
-  <div class="el-dialog">
-    <p class="topic-title">...【单选题】题干...</p>
-    <ul class="topic-list">
-      <li class="topic-item"><span class="topic-option-item">A.</span><div class="item-topic">...</div></li>
-    </ul>
-    <p class="answer">正确答案：C</p>      <!-- 作答后出现 -->
-    <div class="dialog-footer"><div class="btn">关闭</div></div>
-  </div>
-</div>
-```
-点选项即判分（错误会显示「错误」并给出正确答案），再点「关闭」继续。扩展按这个流程做。
+### 2. 加载扩展
 
-**章节列表**（在右侧 `.box-right` 的 `.chapterScrollbar` 里）
-```html
-<li class="clearfix video current_play">   <!-- 当前节 -->
-  <b class="pl5 hour">2.1</b>
-  <span class="catalogue_title">...</span>
-  <div class="el-progress" aria-valuenow="60">...</div>  <!-- 在看的进度 -->
-</li>
-<li class="clearfix video">                 <!-- 已完成 -->
-  ...
-  <b class="time_icofinish"></b>            <!-- 有对勾 = 已完成 -->
-</li>
-<li class="chapter-test">平时测试</li>        <!-- 不点 -->
-```
-完成判定用「有没有 `.time_icofinish`」，当前节用 `.current_play`，章节测试 `li.chapter-test` 永远不点。
+#### Chrome 浏览器
+1. 地址栏输入 `chrome://extensions` 并回车。
+2. 打开右上角的「**开发者模式**」。
+3. 点击左上角「**加载已解压的扩展程序**」，选择解压后的 `zhihuishu-auto` 文件夹。
+4. 点击浏览器右上角拼图图标，将「**智慧树自动刷课**」固定到工具栏。
+
+#### Edge 浏览器
+1. 地址栏输入 `edge://extensions` 并回车。
+2. 打开左侧或左下角的「**开发人员模式**」。
+3. 点击「**加载解压缩的扩展**」，选择解压后的 `zhihuishu-auto` 文件夹。
+4. 将扩展图标固定到工具栏。
 
 ---
 
-## 四、调试
+## 🚀 使用说明
 
-打开课程页按 F12：
+1. 登录智慧树，进入共享课视频学习页（网址形如 `https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=...`）。
+2. 插件会自动接管播放器与章节状态；点击工具栏上的扩展图标可查看当前运行状态（如 `播放中 3:20 / 11:14 · 结算进度 74%` 或 `· 已完成✓`）。
+3. 挂机期间可自由切换到其他标签页或最小化浏览器窗口。
 
-- Console 搜 `[ZHS]`：所有动作日志（绑定视频、作答、切节、跳过）
-- `__ZHS_STATUS__()`：当前状态对象（是否有视频、是否暂停、弹题是否被识别、统计）
-- 弹题没被识别时，在弹题打开的状态下执行：
-  ```js
-  document.querySelector('#playTopic-dialog')?.outerHTML
-  ```
-  复制结果发我，我按新结构改 `src/config.js`。
+### 面板配置项
 
-扩展代码里所有 DOM 线索都在 [src/config.js](src/config.js)，改完在 `chrome://extensions` 点扩展卡片上的刷新按钮即可，不用重装。
-
----
-
-## 五、已知限制
-
-1. **只做弹题**，不碰章节测验（`li.chapter-test` 的「平时测试」）、作业、考试、直播、讨论区。
-2. **1 倍速原速**播放（没有启用倍速）。想加速可以告诉我，但倍速更容易被平台识别。
-3. 弹题目前按「点一个选项 → 等判定 → 关闭」处理；如果遇到多选题需要点「提交」，已做了兼容（会找「提交/确定」按钮），但没实测过。
-4. 填空、拖拽类弹题不会做，会等 1.5 秒后直接关掉，保证视频能继续。
-5. 「切后台继续播」是页面层伪装：`document.hidden`/`visibilityState`/`hasFocus` 全部伪装成前台。
-   Chrome 仍会对后台标签页的定时器节流（最低 1 分钟一次），所以另外挂了 `MutationObserver`：
-   弹题 DOM 一出现就立即处理，不依赖定时器。
-6. 平台改版后选择器可能失效，改 [src/config.js](src/config.js) 即可。
+| 选项 | 默认值 | 说明 |
+| :--- | :---: | :--- |
+| **总开关** | 开启 | 关闭后插件暂停一切自动操作 |
+| **自动静音** | 开启 | 自动将视频设为静音，防止挂机声音打扰并确保浏览器允许自动播放 |
+| **播完自动下一节** | 开启 | 当前小节结算完成（出现对勾）后自动切换到下一节 |
+| **跳过已完成章节** | 开启 | 自动跳过已带对勾图标（`.time_icofinish`）的小节 |
+| **切后台/最小化继续播** | 开启 | 伪装页面可见性与焦点，并自动关闭「学前必读」「弹图」「学习习惯提醒」等阻断弹窗 |
+| **自动答弹题** | 开启 | 自动作答播放期间弹出的测验题并安全关闭弹窗 |
+| **答题策略** | 自动选正解 | 「自动选正解（推荐）」直接读取选项 `result === 1` 满分作答；「随机选」在无标记时随机选择 |
+| **页面右下角状态角标** | 关闭 | 开启后在视频页右下角显示小型运行状态提示 |
 
 ---
 
-## 六、目录结构
+## 🛠️ 技术原理与防检测机制
 
-```
+智慧树课程学习页（`stuStudy.js` + `app.js`）包含 5 处针对自动化脚本的检测：
+
+1. **弹题选项点击检测（`topicClick`）**：检查点击事件对象的 `e.isTrusted && e.clientX && e.clientY`，普通脚本派发的合成 `MouseEvent`（`isTrusted: false`）会被静默忽略。
+2. **弹题关闭按钮检测（`closeTest`）**：检查 `false !== e.isTrusted`，一旦用合成事件点击「关闭」按钮，立即触发 `this.notTrustScript()`，弹出「检测到异常脚本」警告并强制跳回首页。
+3. **章节列表点击检测（`videoClick`）**：检查末尾参数是否为 `PointerEvent` 且 `isTrusted === false`。
+4. **播放器容器捕获监听（`#container`）**：在捕获阶段监听 `click` 事件，发现 `!e.isTrusted` 即报警拦截。
+5. **定时环境自检（`checkout`）与倍速检测（`onTime`）**：每 60 秒利用页面头部冻结的 `window.originFunction.FunctionToString` 校验 `XMLHttpRequest`、`XMLHttpRequest.prototype.open`、`Element.prototype.addEventListener` 是否为原生 `[native code]`、检查 `window.OCS` 是否存在，以及校验 `video.playbackRate <= 1.8`。
+
+### 本扩展的解决方案
+
+- **Vue 实例级原生调用（[src/main-world.js](src/main-world.js)）**：
+  - 在页面 `mounted` 钩子抹除 `.video-study.__vue__` 之前拦截并保存 `stuStudy` Vue 组件实例（同时支持从 `#app.__vue__.$children` 递归检索）。
+  - 将实例上的 `notTrustScript`、`collectLog`、`checkout`、`checkoutNotTrustScript` 置空并清理 `checkTimer` 定时器。
+  - **弹题作答与关窗零合成事件**：直接读取 `vm.topicInfo.lessonTestQuestionUseInterfaceDtos` 中的题目选项，调用 `vm.topicClickQot(opt, 1)` 完成作答，随后调用 `vm.closeTest({ isTrusted: true })` 关闭弹窗。
+  - **章节切换零合成事件**：直接调用 `vm.videoClick(...)` 切换小节（与平台自带的 `videoNext()` 完全一致）。
+- **`document_start` 原生函数保护**：
+  - 在页面内联 `<script>` 冻结 `window.originFunction` 之前保护 `Function.prototype.toString` 与 `window.OCS`，即使浏览器同时安装了沉浸式翻译、篡改猴等会改写 `XMLHttpRequest` 或 `addEventListener` 的扩展，也不会误触平台的 60 秒环境自检。
+- **`#container` 捕获阶段护栏**：
+  - 在 `window` 捕获阶段拦截一切落入 `#container` 内部的非可信点击，先于播放器容器自身的监听器执行。
+
+---
+
+## 📂 目录结构
+
+```text
 zhihuishu-auto/
-├─ manifest.json           # MV3 清单
+├─ manifest.json        # Chrome / Edge MV3 扩展清单
 ├─ src/
-│  ├─ background.js        # 默认配置 + 图标角标
-│  ├─ main-world.js        # document_start：防检测 + Vue 实例接管
-│  ├─ config.js            # 所有选择器/文案
-│  ├─ app.js               # 播放控制 + 弹题作答 + 补刷重播 + 章节切换
-│  ├─ popup.html/.css/.js  # 扩展面板
-└─ README.md
+│  ├─ background.js     # Service Worker：默认配置初始化与图标角标状态
+│  ├─ main-world.js     # MAIN world (document_start)：防检测护栏与 Vue 实例接管
+│  ├─ config.js         # 页面 DOM 选择器与匹配规则配置
+│  ├─ app.js            # ISOLATED world：播放控制、弹题调度、未完重播与章节切换
+│  ├─ popup.html        # 扩展弹出面板结构
+│  ├─ popup.css         # 扩展弹出面板样式
+│  └─ popup.js          # 扩展弹出面板交互逻辑
+└─ README.md            # 项目说明文档
 ```
 
 ---
 
-## 七、关于「检测到异常脚本」（v0.4.0 已彻底解决）
+## 🔍 调试与排错
 
-逆向课程页 `stuStudy.js` 与 `app.js` 后，平台共有 **5 处**反脚本检测：
+在课程学习页按 `F12` 打开开发者工具（Console）：
 
-1. **弹题选项点击（`topicClick`）**：
-   ```js
-   'isTrusted' in e ? e.isTrusted && e.clientX && e.clientY && this.topicClickQot(opt, 1) : this.topicClickQot(opt, 2)
-   ```
-   合成 `MouseEvent` 的 `'isTrusted' in e` 为 `true` 且 `e.isTrusted === false`，导致合成点击选不上任何选项。
-2. **弹题关闭按钮（`closeTest`）—— v0.3 被拦截的直接原因**：
-   ```js
-   false !== e.isTrusted ? ... : this.notTrustScript()
-   ```
-   只要用合成事件点弹题的「关闭」按钮（`e.isTrusted === false`），会**100% 立即触发** `this.notTrustScript()`，弹出「检测到异常脚本，为保证您的正常学习进度，请您关闭插件后，回到学堂重新进入视频学习页正常学习」并跳转回首页。
-3. **章节列表点击（`videoClick`）**：最后一个参数是 `PointerEvent` 且 `isTrusted === false` 时触发 `notTrustScript()`。
-4. **播放器容器点击（`#container`）**：挂了捕获阶段 `click` 监听，`!e.isTrusted` 直接报错并跳走。
-5. **每 60 秒环境自检（`checkout`）与倍速检测（`onTime`）**：
-   - 使用页面头部冻结的 `window.originFunction.FunctionToString` 检查 `XMLHttpRequest`、`XMLHttpRequest.prototype.open`、`Element.prototype.addEventListener` 是否为 `[native code]`，以及 `!window.OCS`。
-   - 检查 `video.playbackRate > 1.8`。
+- 过滤 `[ZHS]` 或 `[ZHS-MW]` 可查看扩展的详细运行日志（Vue 实例接管、弹题作答、重播补刷、章节切换等）。
+- 在控制台输入 `__ZHS_STATUS__()` 回车，可查看当前视频状态、Vue 接管状态、当前小节结算百分比及统计数据。
+- 若平台前端改版导致部分选择器变化，可修改 [src/config.js](src/config.js)，随后在浏览器扩展管理页点击刷新按钮即可生效。
 
-### v0.4.0 的解决方式
+---
 
-1. **接管 `stuStudy` Vue 组件实例（`src/main-world.js`）**：
-   - 在页面 `mounted` 钩子抹除 `.video-study.__vue__` 之前拦截并捕获 Vue 实例（同时支持从 `#app.__vue__.$children` 递归查找）。
-   - 直接将实例上的 `notTrustScript`、`collectLog`、`checkout`、`checkoutNotTrustScript` 置空并清除 `checkTimer` 定时器。
-   - **弹题作答与关窗不再派发任何合成 DOM 事件**：直接读取 `vm.topicInfo.lessonTestQuestionUseInterfaceDtos` 中带有 `result === 1` 的正确选项调用 `vm.topicClickQot(opt, 1)`，作答完毕后调用 `vm.closeTest({ isTrusted: true })` 安全关闭。
-   - **章节切换**：直接调用 `vm.videoClick(...)`（与平台自带的 `videoNext()` 一致），不产生合成事件。
-2. **在 `document_start` 保护 `Function.prototype.toString` 与 `window.OCS`**：
-   - 在页面内联 `<script>` 创建并冻结 `window.originFunction` 之前包装 `Function.prototype.toString`，即使浏览器里同时开启了沉浸式翻译、篡改猴等会改写 `XMLHttpRequest.prototype.open` 或 `addEventListener` 的扩展，平台自检也始终读到原生的 `[native code]`。
-3. **`window` 捕获阶段护栏**：
-   - 在 `window` 捕获阶段拦截一切落入 `#container` 的非可信点击（`stopImmediatePropagation`），先于 `#container` 自身的捕获监听器执行。
+## ⚠️ 免责声明
 
-## 八、风险提示
-
-这类自动化本质上是替你“看课”，可能违反智慧树平台规则或学校的学术诚信要求，平台也有检测异常播放/答题的手段。
-本扩展做了保守处理（真实鼠标事件、随机延迟、不倍速、不加显眼 DOM），但不承诺不被检测。
-建议先用一门不重要的课试跑，确认进度正常后再考虑主账号。
+1. 本项目仅供个人学习与浏览器扩展技术交流使用，请勿用于任何商业用途。
+2. 自动化脚本可能违反所在院校或智慧树平台的相关规定，使用本扩展产生的一切风险与后果（包括但不限于学习进度异常、账号风控等）由使用者自行承担。
